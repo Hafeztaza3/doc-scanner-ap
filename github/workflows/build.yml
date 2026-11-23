@@ -1,0 +1,253 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'__EOF__'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "DocScanner"
+          include(":app")
+          __EOF__
+          cat > build.gradle.kts <<'__EOF__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __EOF__
+          cat > gradle.properties <<'__EOF__'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          __EOF__
+          mkdir -p app
+          cat > app/build.gradle.kts <<'__EOF__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.fegt.docscanner"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.fegt.docscanner"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("com.google.android.gms:play-services-mlkit-document-scanner:16.0.0-beta1")
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-ktx:1.9.0")
+          }
+          __EOF__
+          cat > app/proguard-rules.pro <<'__EOF__'
+          -dontwarn **
+          __EOF__
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="false"
+                  android:icon="@android:drawable/ic_menu_camera"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/AppTheme">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
+                  </provider>
+              </application>
+          </manifest>
+          __EOF__
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/file_paths.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths><files-path name="scans" path="scans/" /></paths>
+          __EOF__
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'__EOF__'
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.Light.DarkActionBar" />
+          </resources>
+          __EOF__
+          cat > app/src/main/res/values/strings.xml <<'__EOF__'
+          <resources>
+              <string name="app_name">ماسح المستندات</string>
+              <string name="scan">مسح مستند جديد</string>
+              <string name="empty">لا توجد مستندات بعد</string>
+              <string name="open">فتح</string>
+              <string name="share">مشاركة / حفظ</string>
+              <string name="delete">حذف</string>
+              <string name="chooser">مشاركة PDF</string>
+              <string name="error">تعذّر تشغيل الماسح. تأكد من تحديث خدمات Google Play.</string>
+          </resources>
+          __EOF__
+          mkdir -p app/src/main/java/com/fegt/docscanner
+          cat > app/src/main/java/com/fegt/docscanner/MainActivity.kt <<'__EOF__'
+          package com.fegt.docscanner
+
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.text.format.DateFormat
+          import android.text.format.Formatter
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.IntentSenderRequest
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.core.content.FileProvider
+          import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
+          import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
+          import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class MainActivity : ComponentActivity() {
+
+              private val dir by lazy { File(filesDir, "scans").apply { mkdirs() } }
+              private var files = listOf<File>()
+              private lateinit var adapter: ArrayAdapter<String>
+              private lateinit var empty: TextView
+
+              private val launcher = registerForActivityResult(
+                  ActivityResultContracts.StartIntentSenderForResult()
+              ) { r ->
+                  if (r.resultCode == RESULT_OK) {
+                      val uri = GmsDocumentScanningResult.fromActivityResultIntent(r.data)?.pdf?.uri
+                          ?: return@registerForActivityResult
+                      val name = "scan_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".pdf"
+                      val out = File(dir, name)
+                      contentResolver.openInputStream(uri)?.use { i -> out.outputStream().use { i.copyTo(it) } }
+                      refresh()
+                      openPdf(out)
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  val btn = Button(this).apply {
+                      text = getString(R.string.scan)
+                      textSize = 18f
+                      setBackgroundColor(Color.parseColor("#1565C0"))
+                      setTextColor(Color.WHITE)
+                      setOnClickListener { startScan() }
+                  }
+                  empty = TextView(this).apply {
+                      text = getString(R.string.empty)
+                      gravity = Gravity.CENTER
+                      setPadding(0, pad * 3, 0, 0)
+                  }
+                  adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, mutableListOf<String>())
+                  val list = ListView(this)
+                  list.adapter = adapter
+                  list.setOnItemClickListener { _, _, i, _ -> menu(files[i]) }
+                  root.addView(btn, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  root.addView(empty)
+                  root.addView(list, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                  setContentView(root)
+                  refresh()
+              }
+
+              private fun startScan() {
+                  val options = GmsDocumentScannerOptions.Builder()
+                      .setGalleryImportAllowed(true)
+                      .setPageLimit(100)
+                      .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_PDF)
+                      .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
+                      .build()
+                  GmsDocumentScanning.getClient(options).getStartScanIntent(this)
+                      .addOnSuccessListener { launcher.launch(IntentSenderRequest.Builder(it).build()) }
+                      .addOnFailureListener { Toast.makeText(this, R.string.error, Toast.LENGTH_LONG).show() }
+              }
+
+              private fun refresh() {
+                  files = dir.listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
+                  adapter.clear()
+                  adapter.addAll(files.map {
+                      it.name + "\n" + DateFormat.format("yyyy/MM/dd HH:mm", it.lastModified()) +
+                          "  •  " + Formatter.formatShortFileSize(this, it.length())
+                  })
+                  empty.visibility = if (files.isEmpty()) View.VISIBLE else View.GONE
+              }
+
+              private fun uriOf(f: File) = FileProvider.getUriForFile(this, "$packageName.fileprovider", f)
+
+              private fun openPdf(f: File) {
+                  val i = Intent(Intent.ACTION_VIEW).setDataAndType(uriOf(f), "application/pdf")
+                      .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  try { startActivity(i) } catch (e: Exception) { sharePdf(f) }
+              }
+
+              private fun sharePdf(f: File) {
+                  val i = Intent(Intent.ACTION_SEND).setType("application/pdf")
+                      .putExtra(Intent.EXTRA_STREAM, uriOf(f))
+                      .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  startActivity(Intent.createChooser(i, getString(R.string.chooser)))
+              }
+
+              private fun menu(f: File) {
+                  AlertDialog.Builder(this).setTitle(f.name)
+                      .setItems(arrayOf(getString(R.string.open), getString(R.string.share), getString(R.string.delete))) { _, w ->
+                          when (w) { 0 -> openPdf(f); 1 -> sharePdf(f); else -> { f.delete(); refresh() } }
+                      }.show()
+              }
+          }
+          __EOF__
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DocScanner-APK
+          path: app/build/outputs/apk/debug/*.apk
